@@ -5814,6 +5814,207 @@ static void scenario_att_hint_gyr_bias_prior_cap(void)
     }
 }
 
+/* Body-frame velocity aiding (REQ-NAV-096). Manual-init a level filter at
+ * vel_ned turning at yaw_rate about body down and run it live. nhc turns on
+ * the lateral constraint (REQ-NAV-077) with no coasting delay. */
+static bool body_vel_test_start(ins_t* f, ins_time_us_t* t_io, const float vel_ned[3],
+                                float yaw_rate, bool nhc)
+{
+    ins_init_t init;
+    fill_default_init(&init, 0);
+    ins_options_t opt;
+    fill_default_opt(&opt);
+    opt.auto_zupt_disable = true; /* see speed_test_start */
+    if (nhc)
+    {
+        opt.automotive_mode               = true;
+        opt.automotive_lateral_constraint = true;
+        opt.automotive_lateral_after_sec  = -1.0f; /* whenever the gates pass */
+    }
+    vec3_assign(init.vel_ned, vel_ned);
+
+    memset(f, 0, sizeof(*f));
+    if (ins_init(f, &init, &opt) != 0) { return false; }
+
+    float g_vec[3];
+    ins_gravity_ned((float)init.llh[0], (float)init.llh[2], g_vec);
+    const float acc_body[3] = {0.0f, 0.0f, -g_vec[2]};
+    const float gyr_body[3] = {0.0f, 0.0f, yaw_rate};
+    const float dt          = 0.01f;
+    int         step;
+    for (step = 0; step < 200; ++step)
+    {
+        *t_io += us_from_sec(dt);
+        ins_measurements_t m;
+        memset(&m, 0, sizeof(m));
+        m.timestamp = *t_io;
+        set_imu(&m, acc_body, gyr_body, dt);
+        ins_update(f, &m);
+    }
+    return f->is_initialized;
+}
+
+/* One epoch carrying a body velocity with a diagonal covariance (sd <= 0:
+ * axis unmeasured). */
+static void body_vel_test_feed(ins_t* f, ins_time_us_t* t_io, const float vel_b[3],
+                               const float sd[3], const float lever_b[3], float yaw_rate,
+                               int delay_ms)
+{
+    float g_vec[3];
+    ins_gravity_ned((float)(48.783 * M_PI / 180.0), 300.0f, g_vec);
+    const float acc_body[3] = {0.0f, 0.0f, -g_vec[2]};
+    const float gyr_body[3] = {0.0f, 0.0f, yaw_rate};
+    const float dt          = 0.01f;
+    *t_io += us_from_sec(dt);
+    ins_measurements_t m;
+    memset(&m, 0, sizeof(m));
+    m.timestamp = *t_io;
+    set_imu(&m, acc_body, gyr_body, dt);
+    int i;
+    for (i = 0; i < 3; ++i)
+    {
+        m.body_vel.vel_b[i]         = vel_b[i];
+        m.body_vel.Qll_b[i * 3 + i] = (sd[i] > 0.0f) ? sd[i] * sd[i] : 0.0f;
+        m.body_vel_leverarm_b[i]    = lever_b ? lever_b[i] : 0.0f;
+    }
+    m.body_vel.is_valid = true;
+    m.body_vel_delay_ms = delay_ms;
+    ins_update(f, &m);
+}
+
+static void scenario_body_vel_aiding(void)
+{
+    printf("\n=== Scenario: body-frame velocity aiding (REQ-NAV-096) ===\n");
+
+    /* Level, yaw 0: body axes are NED, so v_b = (12, 5, 0). */
+    const float vel_ned[3] = {12.0f, 5.0f, 0.0f};
+    const float sd_xy[3]   = {0.05f, 0.05f, 0.0f}; /* 2D flow: z unmeasured */
+
+    /* --- forward 2 m/s slower than the filter: x pulled back, y kept --- */
+    {
+        ins_t         f;
+        ins_time_us_t t = 0;
+        if (!body_vel_test_start(&f, &t, vel_ned, 0.0f, false))
+        {
+            printf("  FAIL  filter did not start\n");
+            fails++;
+            return;
+        }
+        float v0[3], v1[3];
+        ins_get_velocity_ned(&f, v0);
+        const float meas[3] = {v0[0] - 2.0f, v0[1], 0.0f};
+        body_vel_test_feed(&f, &t, meas, sd_xy, NULL, 0.0f, 0);
+        ins_get_velocity_ned(&f, v1);
+        const ins_diag_t* d = ins_get_diag(&f);
+        CHECK_TRUE(d->n_body_vel_seen == 1, "body velocity counted as seen");
+        CHECK_TRUE(d->n_body_vel_used == 1, "body velocity fused");
+        CHECK_NEAR(d->last_body_vel_residual_mps[0], 2.0f, 0.05, "x residual is predicted - z");
+        CHECK_NEAR(d->last_body_vel_residual_mps[1], 0.0f, 0.05, "no y residual");
+        CHECK_NEAR(d->last_body_vel_residual_mps[2], 0.0f, 1e-9, "z unmeasured: no residual");
+        CHECK_TRUE(v1[0] < v0[0] && v1[0] > v0[0] - 2.0f, "north velocity pulled part way");
+        /* Not exactly: with 5 m/s sideways the x row also reaches the yaw
+           (row x of [v_b x] M), and a yaw correction turns the velocity. */
+        CHECK_TRUE(fabsf(v1[1] - v0[1]) < 0.25f * (v0[0] - v1[0]),
+                   "east velocity moves far less than north");
+    }
+
+    /* --- the direction counts: a sideways error moves the sideways velocity,
+           which the scalar speed (REQ-NAV-068) cannot see --- */
+    {
+        ins_t         f;
+        ins_time_us_t t = 0;
+        if (!body_vel_test_start(&f, &t, vel_ned, 0.0f, false)) { return; }
+        float v0[3], v1[3];
+        ins_get_velocity_ned(&f, v0);
+        const float meas[3] = {v0[0], v0[1] + 1.0f, 0.0f};
+        body_vel_test_feed(&f, &t, meas, sd_xy, NULL, 0.0f, 0);
+        ins_get_velocity_ned(&f, v1);
+        CHECK_TRUE(v1[1] > v0[1] + 0.1f, "east velocity pulled towards the reading");
+        CHECK_NEAR(v1[0], v0[0], 0.1, "north velocity stays");
+    }
+
+    /* --- lever arm: at standstill turning at 0.2 rad/s, a sensor 1 m ahead
+           moves sideways at 0.2 m/s; reading that leaves no residual --- */
+    {
+        ins_t         f;
+        ins_time_us_t t        = 0;
+        const float   zero3[3] = {0.0f, 0.0f, 0.0f};
+        const float   rate     = 0.2f;
+        const float   lever[3] = {1.0f, 0.0f, 0.0f};
+        if (!body_vel_test_start(&f, &t, zero3, rate, false)) { return; }
+        const float meas[3] = {0.0f, rate, 0.0f};
+        body_vel_test_feed(&f, &t, meas, sd_xy, lever, rate, 0);
+        CHECK_TRUE(ins_get_diag(&f)->n_body_vel_used == 1, "lever-arm sample fused");
+        CHECK_NEAR(ins_get_diag(&f)->last_body_vel_residual_mps[1], 0.0f, 0.01,
+                   "omega x l predicted");
+        body_vel_test_feed(&f, &t, zero3, sd_xy, lever, rate, 0);
+        CHECK_NEAR(ins_get_diag(&f)->last_body_vel_residual_mps[1], rate, 0.02,
+                   "omega x l seen against a zero reading");
+    }
+
+    /* --- input contract: no measured axis, or non-finite values --- */
+    {
+        ins_t         f;
+        ins_time_us_t t = 0;
+        if (!body_vel_test_start(&f, &t, vel_ned, 0.0f, false)) { return; }
+        const uint32_t bad0    = ins_get_diag(&f)->n_invalid_input;
+        const float    none[3] = {0.0f, -1.0f, 0.0f};
+        body_vel_test_feed(&f, &t, vel_ned, none, NULL, 0.0f, 0);
+        CHECK_TRUE(ins_get_diag(&f)->n_invalid_input == bad0 + 1,
+                   "no measured axis counted as invalid input");
+        const float nan3[3] = {NAN, 5.0f, 0.0f};
+        body_vel_test_feed(&f, &t, nan3, sd_xy, NULL, 0.0f, 0);
+        CHECK_TRUE(ins_get_diag(&f)->n_invalid_input == bad0 + 2,
+                   "non-finite velocity counted as invalid input");
+        CHECK_TRUE(ins_get_diag(&f)->n_body_vel_seen == 0, "invalid samples not seen");
+    }
+
+    /* --- outlier: a 30 m/s miss is downweighted, not swallowed whole --- */
+    {
+        ins_t         f;
+        ins_time_us_t t = 0;
+        if (!body_vel_test_start(&f, &t, vel_ned, 0.0f, false)) { return; }
+        float v0[3], v1[3];
+        ins_get_velocity_ned(&f, v0);
+        const uint32_t dw0     = ins_get_diag(&f)->n_downweighted;
+        const float    meas[3] = {v0[0] + 30.0f, v0[1], 0.0f};
+        body_vel_test_feed(&f, &t, meas, sd_xy, NULL, 0.0f, 0);
+        ins_get_velocity_ned(&f, v1);
+        CHECK_TRUE(ins_get_diag(&f)->n_downweighted == dw0 + 1, "outlier downweighted");
+        CHECK_TRUE(v1[0] - v0[0] < 15.0f, "outlier does not take the filter half way");
+    }
+
+    /* --- delay: anchored in the history, or skipped past its horizon --- */
+    {
+        ins_t         f;
+        ins_time_us_t t = 0;
+        if (!body_vel_test_start(&f, &t, vel_ned, 0.0f, false)) { return; }
+        body_vel_test_feed(&f, &t, vel_ned, sd_xy, NULL, 0.0f, 50);
+        CHECK_TRUE(ins_get_diag(&f)->n_body_vel_used == 1, "delayed sample fused");
+        body_vel_test_feed(&f, &t, vel_ned, sd_xy, NULL, 0.0f, INS_MAX_DELAY_MS + 1);
+        CHECK_TRUE(ins_get_diag(&f)->n_body_vel_skipped == 1, "over-aged sample skipped");
+    }
+
+    /* --- the lateral constraint stands down while a body velocity is fed,
+           and comes back once it stops --- */
+    {
+        ins_t         f;
+        ins_time_us_t t = 0;
+        if (!body_vel_test_start(&f, &t, vel_ned, 0.0f, true)) { return; }
+        f.t_last_nhc_fusion = 0;
+        int i;
+        for (i = 0; i < 300; ++i) { body_vel_test_feed(&f, &t, vel_ned, sd_xy, NULL, 0.0f, 0); }
+        CHECK_TRUE(f.t_last_nhc_fusion == 0, "no lateral constraint next to a body velocity");
+        const float nothing[3] = {0.0f, 0.0f, 0.0f};
+        for (i = 0; i < 300; ++i)
+        {
+            /* Same epochs, but the sample is unusable: no measured axis. */
+            body_vel_test_feed(&f, &t, vel_ned, nothing, NULL, 0.0f, 0);
+        }
+        CHECK_TRUE(f.t_last_nhc_fusion != 0, "lateral constraint back after the hold-off");
+    }
+}
+
 /* Manual-init a filter in level, unaccelerated cruise at vel_ned and run
  * it far enough to be live. Returns the epoch reached via t_io. */
 static bool speed_test_start(ins_t* f, ins_time_us_t* t_io, const float vel_ned[3],
@@ -16013,6 +16214,7 @@ int main(void)
     scenario_autoinit_att_hint();
     scenario_att_hint_gyr_bias_prior_cap();
     scenario_speed_aiding();
+    scenario_body_vel_aiding();
     scenario_range_aiding();
     scenario_range_leverarm_attitude();
     scenario_range_delay();

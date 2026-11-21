@@ -163,6 +163,12 @@ _Static_assert(KALMAN_MAX_NOISE_SIZE >= INS_NOISE_COLS_MAX,
 #define INS_NHC_AFTER_SEC        (5.0f)
 #define INS_NHC_MIN_INTERVAL_SEC (1.0f)
 
+/* Body-frame velocity aiding (REQ-NAV-096): for this long after a fused
+   body velocity the lateral constraint stands down. Longer than the gap
+   between two samples of a 10 Hz source, so the constraint does not slip in
+   between them, short enough to come back soon after the source stops. */
+#define INS_BODY_VEL_NHC_HOLDOFF_SEC (1.0f)
+
 /* Magnetometer field-strength disturbance gate: relative |B| deviation
    from the WMM total field beyond which the sample is downweighted
    (used when opt.mag_field_tolerance == 0). */
@@ -3162,6 +3168,98 @@ static void ins_fuse_speed(ins_t* f, const ins_measurements_t* m)
     }
 }
 
+/* Body-frame velocity (REQ-NAV-096): the velocity of a sensor point fixed to
+ * the body, in body axes (optical flow, wheel odometry with its sideways
+ * zero).
+ *
+ *     h(x) = M v_n + omega_b x l,   M = R_b_to_n^T, l = body_vel_leverarm_b
+ *
+ * With the psi-angle convention of ins_fuse_lateral_constraint() the error
+ * is dv_b = M dv + [v_b x] M psi (v_b = M v_n), so row a of M sits on the
+ * velocity states and row a of [v_b x] M on the attitude states, the
+ * lateral constraint's rows on every measured axis. The lever-arm term is
+ * in body axes already and has no attitude coupling; its gyro-bias coupling
+ * is left out like the GNSS lever arm's. Rows are taken at the time of
+ * validity (REQ-NAV-092) and chi2-gated like the speed. Axes with a
+ * variance <= 0 are left out. */
+/* @satisfies REQ-NAV-096 */
+static void ins_fuse_body_vel(ins_t* f, const ins_measurements_t* m)
+{
+    if (!m->body_vel.is_valid) { return; }
+    f->diag.n_body_vel_seen++;
+
+    const ins_time_us_t age_us = ins_meas_age_us(m->body_vel_delay_ms, m->body_vel_delay_us);
+    if (age_us > INS_MAX_DELAY_MS * INS_US_PER_MS)
+    {
+        f->diag.n_body_vel_skipped++;
+        return;
+    }
+    ins_tov_state_t tov;
+    if (!ins_state_at_tov(f, m->timestamp, age_us, &tov))
+    {
+        f->diag.n_body_vel_skipped++;
+        return;
+    }
+
+    float v_b[3], wxl_b[3];
+    mat3t_mul_vec3(tov.R_b_to_n, tov.vel_ned, v_b);
+    ins_cross(tov.omega_b_nb, m->body_vel_leverarm_b, wxl_b);
+
+    /* Measured axes, in order (the sanitizer guarantees at least one). */
+    int axis[3];
+    int mm = 0;
+    int a, b, j;
+    for (a = 0; a < 3; ++a)
+    {
+        if (MAT_ELEM(m->body_vel.Qll_b, a, a, 3, 3) > 0.0f) { axis[mm++] = a; }
+    }
+
+    /* Row a of [v_b x]: [v_b x] = [0 -vz vy; vz 0 -vx; -vy vx 0]. */
+    const float S[9] = {0.0f,    v_b[2], -v_b[1], /* column-major */
+                        -v_b[2], 0.0f,   v_b[0],  /* */
+                        v_b[1],  -v_b[0], 0.0f};
+
+    float z[3], R[3 * 3];
+    float Ht[INS_UNKNOWNS_MAX * 3];
+    memset(Ht, 0, sizeof(float) * (size_t)f->n * (size_t)mm);
+    for (b = 0; b < 3; ++b) { f->diag.last_body_vel_residual_mps[b] = 0.0f; }
+    int k, l;
+    for (k = 0; k < mm; ++k)
+    {
+        a    = axis[k];
+        z[k] = v_b[a] + wxl_b[a] - m->body_vel.vel_b[a];
+        f->diag.last_body_vel_residual_mps[a] = z[k];
+        for (l = 0; l < mm; ++l)
+        {
+            MAT_ELEM(R, k, l, mm, mm) = MAT_ELEM(m->body_vel.Qll_b, a, axis[l], 3, 3);
+        }
+        for (j = 0; j < 3; ++j)
+        {
+            /* velocity: row a of M, i.e. column a of R_b_to_n */
+            MAT_ELEM(Ht, INS_IDX_VEL + j, k, f->n, mm) = MAT_ELEM(tov.R_b_to_n, j, a, 3, 3);
+            /* attitude: row a of [v_b x] M */
+            float h = 0.0f;
+            for (b = 0; b < 3; ++b)
+            {
+                h += MAT_ELEM(S, a, b, 3, 3) * MAT_ELEM(tov.R_b_to_n, j, b, 3, 3);
+            }
+            MAT_ELEM(Ht, INS_IDX_RPY + j, k, f->n, mm) = h;
+        }
+    }
+
+    if (ins_fuse(f, z, R, Ht, mm, f->chi2_thr_gnss, 1 /* downweight outliers (REQ-SYS-006) */) ==
+        0)
+    {
+        f->diag.n_body_vel_used++;
+        f->t_last_body_vel_fusion = m->timestamp;
+        if (!f->log_state.body_vel_logged)
+        {
+            f->log_state.body_vel_logged = true;
+            LOG_INFO("ins: body-frame velocity aiding active (%d axes)", mm);
+        }
+    }
+}
+
 /* Range fusion kernel (REQ-NAV-082): the "line of sight plus residual" layer.
  * u_n is the unit vector from the antenna towards the anchor in the n-frame,
  * la_n the antenna lever arm in the n-frame at the time of validity and
@@ -3446,6 +3544,15 @@ static void ins_fuse_lateral_constraint(ins_t* f, const ins_measurements_t* m)
                                    ? f->opt.automotive_lateral_max_yaw_rate
                                    : INS_NHC_MAX_YAW_RATE;
     if (fabsf(f->last_omega_b_nb[2]) > max_yaw_rate) return;
+
+    /* A measured body velocity (REQ-NAV-096) carries the lateral channel
+       itself, at its real lever arm and with its real noise: the synthetic
+       zero on top of it would count the same information twice. */
+    if (f->t_last_body_vel_fusion != 0 &&
+        time_diff_sec(m->timestamp, f->t_last_body_vel_fusion) < INS_BODY_VEL_NHC_HOLDOFF_SEC)
+    {
+        return;
+    }
 
     /* Rate limited because the residual is a slowly varying offset rather
        than white noise (REQ-NAV-077), so a faster fusion rate would only
@@ -6088,6 +6195,24 @@ static void ins_sanitize_measurements(ins_t* f, const ins_measurements_t* in,
         }
     }
 
+    /* Body-frame velocity (REQ-NAV-096): finite values, and at least one
+       measured axis. A variance <= 0 is "not measured", not an error. */
+    if (out->body_vel.is_valid)
+    {
+        const float* Q = out->body_vel.Qll_b;
+        if (!ins_vec3_finite(out->body_vel.vel_b) || !mat33_finite(Q) ||
+            !(Q[0] > 0.0f || Q[4] > 0.0f || Q[8] > 0.0f))
+        {
+            out->body_vel.is_valid = false;
+            f->diag.n_invalid_input++;
+        }
+    }
+    if (!ins_vec3_finite(out->body_vel_leverarm_b))
+    {
+        vec3_zero(out->body_vel_leverarm_b);
+        f->diag.n_invalid_input++;
+    }
+
     /* Throttled summary instead of one LOG_WARN per rejected field: a
        flaky sensor bus can otherwise flood the sink at the update rate. */
     if (f->diag.n_invalid_input != n_invalid_before)
@@ -6379,6 +6504,9 @@ void ins_correct_step(ins_t* f)
                how long that coasting has lasted (REQ-NAV-077). Running it
                after ins_fuse_gnss would let the fix that ends an outage reset
                that clock in the same epoch. */
+            /* Before the constraint, which stands down while this one is
+               fed (REQ-NAV-096). */
+            ins_fuse_body_vel(f, m);
             ins_fuse_lateral_constraint(f, m);
         }
 

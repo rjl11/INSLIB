@@ -252,6 +252,28 @@ typedef struct
     bool  is_valid;   /**< is this measurement usable? */
 } ins_meas_speed_t;
 
+/** @brief Body-frame velocity measurement (REQ-NAV-096).
+ *
+ *  The velocity of a sensor point fixed to the body, in body axes: an
+ *  optical-flow camera looking at the ground, a wheel odometer with its
+ *  non-holonomic sideways zero, a Doppler velocity log. Fused as
+ *      h(x) = R_n_to_b * v_n + omega_b x leverarm
+ *  with the lever arm from ins_measurements_t.body_vel_leverarm_b, so unlike
+ *  the scalar speed (REQ-NAV-068) it carries the direction, and its rows
+ *  reach the attitude through the velocity.
+ *
+ *  An axis whose variance (diagonal of Qll_b) is zero or negative is not
+ *  measured and is left out, with its row and column of Qll_b: a 2D flow
+ *  (x/y) and a 3D velocity share the type. At least one axis must be
+ *  measured. Same "new sample only" contract as the barometer. */
+typedef struct
+{
+    float vel_b[3];     /**< sensor velocity in body axes [m/s] */
+    float Qll_b[3 * 3]; /**< covariance [(m/s)^2], 3x3 column-major,
+                             symmetric; diagonal <= 0 -> axis unmeasured */
+    bool is_valid;      /**< is this measurement usable? */
+} ins_meas_body_vel_t;
+
 /** @brief Range to an anchor at a known position (REQ-NAV-082).
  *
  *  A range measurement: the
@@ -394,6 +416,18 @@ typedef struct
        the barometer: a latched is_valid re-fuses one reading every epoch. */
     ins_meas_range_t range[INS_RANGE_MAX]; /**< range entries, any subset valid */
     float            range_leverarm_b[3];  /**< ranging lever arm, body frame [m] */
+
+    /* Body-frame velocity aiding (REQ-NAV-096): optical flow, wheel
+       odometry. Same "new sample only" contract as the barometer. While it
+       is fused, the synthetic lateral constraint (REQ-NAV-077) stands down. */
+    ins_meas_body_vel_t body_vel;               /**< body-frame velocity sample */
+    float               body_vel_leverarm_b[3]; /**< sensor point from the IMU,
+                                                     body frame [m] */
+    int     body_vel_delay_ms;                  /**< >0: measurement is this
+                                                     many ms old. 0 = now. */
+    int32_t body_vel_delay_us;                  /**< >0: further age [us],
+                                                     added to body_vel_delay_ms
+                                                     (REQ-NAV-092). 0 = none. */
 } ins_measurements_t;
 
 /** @brief Initial values supplied to ins_init(). */
@@ -1071,6 +1105,16 @@ typedef struct
                                         was no longer in the history */
     float last_speed_residual_mps; /**< ||v_n|| - z at the last fusion [m/s] */
 
+    /* Body-frame velocity aiding (REQ-NAV-096). */
+    uint32_t n_body_vel_seen;    /**< epochs offering a usable body velocity */
+    uint32_t n_body_vel_used;    /**< epochs where it was actually fused */
+    uint32_t n_body_vel_skipped; /**< usable samples skipped because the
+                                      delayed state was no longer in the
+                                      history */
+    float last_body_vel_residual_mps[3]; /**< predicted - measured, body axes,
+                                              at the last fusion [m/s]
+                                              (0 on unmeasured axes) */
+
     /* Fusion failures. */
     uint32_t n_fuse_fail;     /**< a UDU update returned an error
                                    (non-PD R / bad variance) */
@@ -1308,6 +1352,8 @@ typedef struct
     ins_time_us_t t_last_zero_vel_fusion; /**< last zero-velocity fusion */
     ins_time_us_t t_last_nhc_fusion;      /**< last lateral-constraint fusion
                                                (REQ-NAV-077) */
+    ins_time_us_t t_last_body_vel_fusion; /**< last body-velocity fusion
+                                               (REQ-NAV-096) */
     ins_time_us_t t_init;                 /**< ins_init() timestamp */
     unsigned      kalman_epochs;          /**< ins_update() calls since init */
     bool          is_initialized;         /**< false before init / after a health-check failure */
@@ -1615,7 +1661,9 @@ typedef struct
         bool nhc_logged;                           /**< same, for the lateral
                                                         velocity constraint
                                                         (REQ-NAV-077) */
-        bool gnss_delay_logged;                    /**< true once the one-shot
+        bool body_vel_logged;                      /**< same, for the body-frame
+                                                        velocity (REQ-NAV-096) */
+        bool gnss_delay_logged;                   /**< true once the one-shot
                                                         "first GNSS delay seen" info
                                                         has been printed */
     } log_state;

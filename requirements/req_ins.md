@@ -3254,3 +3254,40 @@ the nominal state or the covariance and the health check (REQ-NAV-042)
 then restarted the filter on every bootstrap, with the same
 configuration. Refusing the init reports the cause where it is, instead
 of a filter that never becomes ready.
+
+## REQ-NAV-096 — Body-frame velocity aiding
+
+- **Status:** verified
+- **Parent:** REQ-NAV-015
+- **Verification:** Test: tests/test_ins_core.c:scenario_body_vel_aiding
+
+ins_measurements_t shall accept an optional velocity of a sensor point
+fixed to the body, in body axes (body_vel), with its lever arm from the IMU
+(body_vel_leverarm_b) and its age (body_vel_delay_ms / body_vel_delay_us,
+REQ-NAV-092), and fuse it as
+
+    h(x) = R_b_to_n^T v_n + omega_b_nb x l
+
+with the residual h(nominal) - z in body axes. The rows shall be those of
+REQ-NAV-077 on every measured axis: row a of R_b_to_n^T on the velocity
+states and row a of [v_b x] R_b_to_n^T on the attitude states, taken at the
+time of validity. An axis whose variance (diagonal of Qll_b) is zero or
+negative is not measured and shall be left out with its row and column of
+Qll_b. A sample with no measured axis, a non-finite velocity or a
+non-finite covariance shall be dropped and counted as invalid input
+(REQ-NAV-018); a non-finite lever arm shall be replaced by zero. Rows shall
+be chi2-gated and outliers downweighted like the speed (REQ-NAV-068). A
+sample older than INS_MAX_DELAY_MS, or one whose time of validity is not
+in the history, shall be skipped and counted. While a body velocity has
+been fused within INS_BODY_VEL_NHC_HOLDOFF_SEC, the lateral constraint
+(REQ-NAV-077) shall not be fused.
+
+Rationale: optical flow and wheel odometry measure a velocity with a
+direction, at a point away from the IMU. The scalar speed (REQ-NAV-068)
+sees only its magnitude and nothing across the track; the lateral
+constraint assumes a zero at the IMU, which is wrong in a turn when the IMU
+is not on the rear axle. One input with a lever arm carries both, and a
+wheel odometer gives its sideways zero as a measured axis with its own
+variance. The lever-arm term's coupling to the gyro bias is left out, as
+for the GNSS lever arm (REQ-NAV-011). This requirement belongs to the
+gnss_smart fork of INSLIB, not to upstream.
