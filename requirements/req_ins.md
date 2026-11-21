@@ -3289,5 +3289,5 @@ constraint assumes a zero at the IMU, which is wrong in a turn when the IMU
 is not on the rear axle. One input with a lever arm carries both, and a
 wheel odometer gives its sideways zero as a measured axis with its own
 variance. The lever-arm term's coupling to the gyro bias is left out, as
-for the GNSS lever arm (REQ-NAV-011). This requirement belongs to the
-gnss_smart fork of INSLIB, not to upstream.
+for the GNSS lever arm (REQ-NAV-011). This requirement belongs to this
+fork of INSLIB, not to upstream.
